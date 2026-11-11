@@ -1,0 +1,15 @@
+[Unit]
+Description=Amp orb base image updater (one-shot, started by amp-orb-updater.timer)
+Documentation=file://%h/Projects/amp-orb-updater/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/amp-orb-updater
+# Never compete with the desktop or a working orb for CPU or disk IO.
+Nice=19
+CPUWeight=10
+IOWeight=10
+IOSchedulingClass=idle
+# A failed run is recorded in the updater's own state; journald keeps the log.

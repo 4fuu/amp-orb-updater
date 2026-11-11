@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the amp-orb base image twice a day
+
+[Timer]
+OnCalendar=*-*-* 10,22:00
+RandomizedDelaySec=30m
+# Catch up a missed window after sleep or boot instead of skipping it.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
