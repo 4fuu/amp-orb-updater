@@ -1,8 +1,11 @@
 [Unit]
-Description=Refresh the amp-orb base image twice a day
+Description=Check the amp-orb base image hourly, all day
 
 [Timer]
-OnCalendar=*-*-* 10,22:00
+# All-day cadence: the digest precheck is one cheap manifest fetch, and the
+# gates (battery, disk, memory-headroom trend) decide whether to pull, so
+# checking often only gives the update more chances to find a calm window.
+OnCalendar=hourly
 RandomizedDelaySec=30m
 # Catch up a missed window after sleep or boot instead of skipping it.
 Persistent=true

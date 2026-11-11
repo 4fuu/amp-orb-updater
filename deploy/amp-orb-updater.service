@@ -12,4 +12,5 @@ Nice=19
 CPUWeight=10
 IOWeight=10
 IOSchedulingClass=idle
-# A failed run is recorded in the updater's own state; journald keeps the log.
+# The memory-headroom watch (2 min) plus a full pull can take a while.
+TimeoutStartSec=15min

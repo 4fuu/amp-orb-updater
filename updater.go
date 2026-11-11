@@ -12,9 +12,19 @@ type config struct {
 	powerRoot    string // sysfs power_supply root for the AC gate
 	homePath     string // filesystem for the free-space gate
 	minFree      uint64
-	prefix       string // running containers with this name prefix block the pull
+	prefix       string // running containers with this name prefix are logged as context
 	maxStaleDays int
 	dryRun       bool
+
+	// Memory-headroom gate: a pull may only start when MemAvailable and
+	// memory PSI have stayed within budget for the whole trend window.
+	// sampleMem/sleepMem are seams for tests; nil means the real thing.
+	minMemAvail uint64
+	maxMemPSI   float64
+	trend       time.Duration
+	forceAfter  time.Duration // pending longer than this skips the memory gate
+	sampleMem   func() (memSample, error)
+	sleepMem    func(time.Duration)
 }
 
 type result struct {
@@ -27,8 +37,12 @@ type result struct {
 //  1. Best-effort registry precheck: when the remote linux/amd64 digest
 //     already matches the local one, finish without touching any gate or
 //     the network beyond one manifest fetch.
-//  2. Gates (battery, running orbs, disk headroom). When any blocks, the
-//     update stays pending and the next timer tick retries.
+//  2. Gates. Battery and disk headroom are hard limits. Memory headroom is
+//     measured as a trend — MemAvailable and memory PSI must stay within
+//     budget for the whole window, because a pull decompresses ~4 GiB. A
+//     pending update older than forceAfter pushes past the memory gate;
+//     battery and disk always apply. When any gate blocks, the update stays
+//     pending and the next timer tick retries.
 //  3. Pull. Podman only moves the tag on success, so a failed pull leaves
 //     the current image untouched.
 //  4. Sweep superseded bases: dangling images carrying the same
@@ -66,7 +80,13 @@ func runOnce(cfg config, r runner, now time.Time, lg *logger) result {
 		lg.infof("update pending: %s -> %s", short(local), short(remote))
 	}
 
-	if blocked := gatherGates(cfg, r, lg); len(blocked) > 0 {
+	// Mark when this update was first seen; gates and the forced path
+	// both read it, and a success clears it.
+	if st.PendingSince == "" {
+		st.PendingSince = now.Format(time.RFC3339)
+	}
+
+	if blocked := gatherGates(cfg, r, st, now, lg); len(blocked) > 0 {
 		for _, b := range blocked {
 			lg.infof("gate: %s", b)
 		}
@@ -138,9 +158,13 @@ func sweepSuperseded(r runner, ref string, lg *logger) {
 	}
 }
 
-// gatherGates collects every reason the update must wait. Cheap local checks
-// first; podman ps last because it takes the store lock.
-func gatherGates(cfg config, r runner, lg *logger) []string {
+// gatherGates collects every reason the update must wait. Battery and disk
+// are hard limits. The memory gate measures the machine instead of guessing
+// from container counts: MemAvailable must cover the pull's decompression
+// peak and memory PSI must stay calm — for the whole trend window, not just
+// at this instant, because "idle now" says nothing about the minute before.
+// A pending update older than forceAfter pushes past the memory gate only.
+func gatherGates(cfg config, r runner, st State, now time.Time, lg *logger) []string {
 	var reasons []string
 
 	if ac, warn := acPower(cfg.powerRoot); !ac {
@@ -149,21 +173,53 @@ func gatherGates(cfg config, r runner, lg *logger) []string {
 		lg.warnf("gate: %s; assuming AC", warn)
 	}
 
-	if names, err := runningNames(r); err != nil {
-		reasons = append(reasons, "cannot list running containers: "+err.Error())
-	} else {
-		for _, n := range names {
-			if strings.HasPrefix(n, cfg.prefix) {
-				reasons = append(reasons, fmt.Sprintf("orb %s is running", n))
-				break
-			}
-		}
-	}
-
 	if free := freeBytes(cfg.homePath); free < cfg.minFree {
 		reasons = append(reasons, fmt.Sprintf("only %s free on %s, need %s", humanBytes(free), cfg.homePath, humanBytes(cfg.minFree)))
 	}
 
+	// Running orbs are context, not a gate: a pull never touches them, the
+	// memory budget decides whether the machine has room for one.
+	if names, err := runningNames(r); err == nil {
+		n := 0
+		for _, name := range names {
+			if strings.HasPrefix(name, cfg.prefix) {
+				n++
+			}
+		}
+		if n > 0 {
+			lg.infof("gate: %d orb(s) running; the memory-headroom gate decides, not the container count", n)
+		}
+	}
+
+	if since, err := time.Parse(time.RFC3339, st.PendingSince); err == nil && now.Sub(since) > cfg.forceAfter {
+		lg.infof("gate: pending since %s (> %s); forcing past the memory gate", st.PendingSince, cfg.forceAfter)
+		return reasons
+	}
+
+	sample := cfg.sampleMem
+	if sample == nil {
+		sample = readMemSample
+	}
+	sleep := cfg.sleepMem
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	dur := cfg.trend
+	if cfg.dryRun {
+		lg.infof("gate: dry run samples once instead of watching for %s", dur)
+		dur = 0
+	} else if dur > 0 {
+		lg.infof("gate: watching memory headroom for %s", dur)
+	}
+	ok, s, err := watchHeadroom(dur, trendInterval, cfg.minMemAvail, cfg.maxMemPSI, sample, sleep)
+	switch {
+	case err != nil:
+		reasons = append(reasons, "cannot read memory headroom: "+err.Error())
+	case !ok:
+		reasons = append(reasons, s.reason(cfg.minMemAvail, cfg.maxMemPSI))
+	default:
+		lg.infof("gate: headroom held (avail %s, PSI some avg10 %.1f%%)", humanBytes(s.AvailBytes), s.PSISome10)
+	}
 	return reasons
 }
 

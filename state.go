@@ -20,6 +20,7 @@ type State struct {
 	LastSuccess         string `json:"last_success"`          // RFC3339 of the last success, "" if never
 	LastChange          string `json:"last_change,omitempty"` // RFC3339 of the last pull that moved the image
 	LastDigest          string `json:"last_digest,omitempty"`
+	PendingSince        string `json:"pending_since,omitempty"` // first observation of the current pending update
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	LastError           string `json:"last_error,omitempty"`
 }
@@ -31,6 +32,7 @@ func (st *State) recordSuccess(now time.Time, digest string, changed bool) {
 	if changed {
 		st.LastChange = st.LastRun
 	}
+	st.PendingSince = ""
 	st.ConsecutiveFailures = 0
 	st.LastError = ""
 }

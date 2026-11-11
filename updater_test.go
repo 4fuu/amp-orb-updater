@@ -101,6 +101,14 @@ func testConfig(t *testing.T) config {
 		minFree:      1, // any real temp filesystem passes
 		prefix:       "amp-",
 		maxStaleDays: 7,
+		minMemAvail:  1 << 30,
+		maxMemPSI:    5.0,
+		trend:        0, // tests sample once unless a case sets a window
+		forceAfter:   72 * time.Hour,
+		sampleMem: func() (memSample, error) {
+			return memSample{AvailBytes: 16 << 30, PSISome10: 0}, nil
+		},
+		sleepMem: func(time.Duration) {},
 	}
 }
 
@@ -169,21 +177,18 @@ func TestPendingUpdateGatedByBattery(t *testing.T) {
 	}
 }
 
-func TestRunningOrbBlocks(t *testing.T) {
+func TestRunningOrbsDoNotBlockWhenHeadroomHolds(t *testing.T) {
 	f := &fakeRunner{}
 	plug(f, digestNew)
-	f.stdouts["ps --format {{.Names}}"] = []string{"personal-bot-bot\namp-T-01a1c625-0000\n"}
+	f.stdouts["ps --format {{.Names}}"] = []string{"amp-T-01a1c625-0000\namp-T-01a1a12a-0000\n"}
 	cfg := testConfig(t)
 
 	res, log := run(t, cfg, f)
-	if res.status != "pending" {
-		t.Fatalf("status = %s, want pending", res.status)
+	if res.status != "updated" {
+		t.Fatalf("status = %s, want updated (orb count is context, not a gate)", res.status)
 	}
-	if f.did("pull") {
-		t.Error("pulled while an orb was running")
-	}
-	if !strings.Contains(log.String(), "amp-T-01a1c625-0000") {
-		t.Errorf("log does not name the blocking orb:\n%s", log)
+	if !strings.Contains(log.String(), "the memory-headroom gate decides") {
+		t.Errorf("log should name the deciding gate:\n%s", log)
 	}
 }
 
@@ -195,7 +200,128 @@ func TestUnrelatedContainersDoNotBlock(t *testing.T) {
 
 	res, _ := run(t, cfg, f)
 	if res.status != "updated" {
-		t.Fatalf("status = %s, want updated (non-amp containers must not gate)", res.status)
+		t.Fatalf("status = %s, want updated", res.status)
+	}
+}
+
+func TestLowMemoryBlocks(t *testing.T) {
+	f := &fakeRunner{}
+	plug(f, digestNew)
+	cfg := testConfig(t)
+	cfg.sampleMem = func() (memSample, error) {
+		return memSample{AvailBytes: 1 << 20, PSISome10: 0}, nil // 1 MiB
+	}
+
+	res, log := run(t, cfg, f)
+	if res.status != "pending" {
+		t.Fatalf("status = %s, want pending", res.status)
+	}
+	if f.did("pull") {
+		t.Error("pulled without memory headroom")
+	}
+	if !strings.Contains(log.String(), "memory available") {
+		t.Errorf("log should give the memory reason:\n%s", log)
+	}
+}
+
+func TestPressureTrendBlocksOnAnyBusySample(t *testing.T) {
+	f := &fakeRunner{}
+	plug(f, digestNew)
+	cfg := testConfig(t)
+	cfg.trend = 30 * time.Second
+	samples := []memSample{
+		{AvailBytes: 16 << 30, PSISome10: 0},
+		{AvailBytes: 16 << 30, PSISome10: 1},
+		{AvailBytes: 16 << 30, PSISome10: 80}, // busy moment inside the window
+		{AvailBytes: 16 << 30, PSISome10: 0},
+	}
+	i := 0
+	cfg.sampleMem = func() (memSample, error) {
+		if i >= len(samples) {
+			t.Fatal("watch kept sampling past the failing sample")
+		}
+		s := samples[i]
+		i++
+		return s, nil
+	}
+
+	res, log := run(t, cfg, f)
+	if res.status != "pending" {
+		t.Fatalf("status = %s, want pending", res.status)
+	}
+	if f.did("pull") {
+		t.Error("pulled although the trend window caught pressure")
+	}
+	if !strings.Contains(log.String(), "PSI some avg10 80.0%") {
+		t.Errorf("log should name the failing sample:\n%s", log)
+	}
+}
+
+func TestForceAfterPushesPastTheMemoryGate(t *testing.T) {
+	f := &fakeRunner{}
+	plug(f, digestNew)
+	cfg := testConfig(t)
+	cfg.sampleMem = func() (memSample, error) {
+		return memSample{AvailBytes: 1 << 20, PSISome10: 99}, nil
+	}
+	stale := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC).Add(-96 * time.Hour)
+	saveState(cfg.statePath, State{Version: 1, PendingSince: stale.Format(time.RFC3339)}, &logger{w: &bytes.Buffer{}})
+
+	res, log := run(t, cfg, f)
+	if res.status != "updated" {
+		t.Fatalf("status = %s, want updated (pending > forceAfter must push through)", res.status)
+	}
+	if !strings.Contains(log.String(), "forcing past the memory gate") {
+		t.Errorf("log should announce the forced path:\n%s", log)
+	}
+}
+
+func TestBatteryStillBlocksWhenForced(t *testing.T) {
+	f := &fakeRunner{}
+	plug(f, digestNew)
+	cfg := testConfig(t)
+	root := t.TempDir()
+	writeSupply(t, root, "Mains", map[string]string{"type": "Mains", "online": "0"})
+	writeSupply(t, root, "BAT0", map[string]string{"type": "Battery", "status": "Discharging"})
+	cfg.powerRoot = root
+	stale := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC).Add(-96 * time.Hour)
+	saveState(cfg.statePath, State{Version: 1, PendingSince: stale.Format(time.RFC3339)}, &logger{w: &bytes.Buffer{}})
+
+	res, _ := run(t, cfg, f)
+	if res.status != "pending" {
+		t.Fatalf("status = %s, want pending (battery is a hard gate even when forced)", res.status)
+	}
+	if f.did("pull") {
+		t.Error("pulled on battery despite the force rule")
+	}
+}
+
+func TestPendingSinceMarkedAndCleared(t *testing.T) {
+	f := &fakeRunner{}
+	plug(f, digestNew)
+	cfg := testConfig(t)
+	cfg.sampleMem = func() (memSample, error) {
+		return memSample{AvailBytes: 1 << 20, PSISome10: 0}, nil // blocks
+	}
+
+	run(t, cfg, f)
+	st := loadState(cfg.statePath, &logger{w: &bytes.Buffer{}})
+	if st.PendingSince == "" {
+		t.Fatal("a blocked update must record pending_since")
+	}
+
+	// Next run with headroom: the pull succeeds and clears the marker.
+	cfg.sampleMem = func() (memSample, error) {
+		return memSample{AvailBytes: 16 << 30, PSISome10: 0}, nil
+	}
+	f2 := &fakeRunner{}
+	plug(f2, digestNew)
+	if res, _ := run(t, cfg, f2); res.status != "updated" {
+		t.Fatalf("status = %s, want updated", res.status)
+	}
+	st = loadState(cfg.statePath, &logger{w: &bytes.Buffer{}})
+	if st.PendingSince != "" {
+		t.Errorf("pending_since must be cleared by success: %+v", st)
 	}
 }
 

@@ -7,8 +7,9 @@ rootless podman through `~/.config/amp-orb-provider/dispatch.sh`.
 The dispatch script deliberately uses `podman run --pull=missing` (local
 image present means never re-pull), so nothing else would ever move the
 tag. This program is that something else. It is a single static Go binary
-with no dependencies outside the standard library, run twice a day by a
-systemd user timer.
+with no dependencies outside the standard library, checked hourly around
+the clock by a systemd user timer — the precheck is one cheap manifest
+fetch, and the gates decide whether a pull may start.
 
 ## What one run does
 
@@ -19,12 +20,18 @@ systemd user timer.
    amd64 manifest digest is exactly what podman stores as the local
    digest for a tag pulled on an amd64 host. A failed or unparseable
    precheck is not fatal; the pull decides instead.
-2. **Gates.** Any of these leaves the update pending for the next tick:
-   - on battery power (sysfs `power_supply`; a machine with no readable
-     supplies counts as on AC),
-   - an orb container (`amp-*` prefix) is running,
-   - less than `--min-free-bytes` (default 12 GiB) free on the filesystem
-     holding `$HOME`.
+2. **Gates.** Battery power (sysfs `power_supply`; a machine with no
+   readable supplies counts as on AC) and disk headroom (≥12 GiB free on
+   the filesystem holding `$HOME`) are hard limits. Pulling never touches
+   running orbs — they keep their image by ID — so the remaining question
+   is whether the machine has room for a ~4 GiB decompression, not who is
+   using it. That is measured, not guessed from container counts:
+   `MemAvailable` must be ≥ `--min-mem-avail-bytes` (default 8 GiB) and
+   memory PSI (`some avg10`) ≤ `--max-mem-psi` (default 5%), and both must
+   hold for the whole `--trend` window (default 2 minutes, sampled every
+   10 s; one busy sample defers the update to the next tick). An update
+   pending longer than `--force-after` (default 72 h) pushes past the
+   memory gate; battery and disk always apply.
 3. **Pull.** `podman pull` only moves the tag on success, so a failed
    pull leaves the running setup untouched.
 4. **Sweep.** Dangling images carrying the same
@@ -95,5 +102,6 @@ never be picked).
 | `podman.go` | the `runner` seam and the podman commands |
 | `digest.go` | amd64 manifest digest from a registry index |
 | `power.go` | AC detection from sysfs |
+| `resources.go` | memory headroom sampling and the trend watch |
 | `state.go` | state file, staleness reasons, logger |
 | `deploy/` | systemd user service + timer |
