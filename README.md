@@ -1,6 +1,7 @@
 # amp-orb-updater
 
-Keeps the base image of this machine's self-hosted amp orb provider fresh:
+Keeps the base image of a self-hosted [Amp](https://ampcode.com/) orb
+provider fresh:
 `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest`, run by
 rootless podman through `~/.config/amp-orb-provider/dispatch.sh`.
 
@@ -105,3 +106,7 @@ never be picked).
 | `resources.go` | memory headroom sampling and the trend watch |
 | `state.go` | state file, staleness reasons, logger |
 | `deploy/` | systemd user service + timer |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
